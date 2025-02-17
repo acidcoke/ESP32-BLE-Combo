@@ -1,15 +1,21 @@
+#include "BleComboKeyboard.h"
+
+#if defined(USE_NIMBLE)
+#include <NimBLEDevice.h>
+#include <NimBLEServer.h>
+#include <NimBLEUtils.h>
+#include <NimBLEHIDDevice.h>
+#else
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include "BLE2902.h"
 #include "BLEHIDDevice.h"
+#endif // USE_NIMBLE
 #include "HIDTypes.h"
 #include <driver/adc.h>
 #include "sdkconfig.h"
 
-#include "BleConnectionStatus.h"
-#include "KeyboardOutputCallbacks.h"
-#include "BleComboKeyboard.h"
 
 #if defined(CONFIG_ARDUHAL_ESP_LOG)
   #include "esp32-hal-log.h"
@@ -131,25 +137,19 @@ static const uint8_t _hidReportDescriptor[] = {
   END_COLLECTION(0)          // END_COLLECTION
 };
 
-BleComboKeyboard::BleComboKeyboard(std::string deviceName, std::string deviceManufacturer, uint8_t batteryLevel) : hid(0)
-{
-  this->deviceName = deviceName;
-  this->deviceManufacturer = deviceManufacturer;
-  this->batteryLevel = batteryLevel;
-  this->connectionStatus = new BleConnectionStatus();
-}
+BleComboKeyboard::BleComboKeyboard(std::string deviceName, std::string deviceManufacturer, uint8_t batteryLevel) 
+    : hid(0)
+    , deviceName(std::string(deviceName).substr(0, 15))
+    , deviceManufacturer(std::string(deviceManufacturer).substr(0,15))
+    , batteryLevel(batteryLevel) {}
 
-void BleComboKeyboard::begin(void)
-{
-  xTaskCreate(this->taskServer, "server", 20000, (void *)this, 5, NULL);
-}
 
 void BleComboKeyboard::end(void)
 {
 }
 
 bool BleComboKeyboard::isConnected(void) {
-  return this->connectionStatus->connected;
+  return this->connected;
 }
 
 void BleComboKeyboard::setBatteryLevel(uint8_t level) {
@@ -158,46 +158,79 @@ void BleComboKeyboard::setBatteryLevel(uint8_t level) {
     this->hid->setBatteryLevel(this->batteryLevel);
 }
 
-void BleComboKeyboard::taskServer(void* pvParameter) {
-  BleComboKeyboard* bleKeyboardInstance = (BleComboKeyboard *) pvParameter; //static_cast<BleComboKeyboard *>(pvParameter);
-  BLEDevice::init(bleKeyboardInstance->deviceName);
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(bleKeyboardInstance->connectionStatus);
+void BleComboKeyboard::begin(void)
+{
+  BLEDevice::init(deviceName);
+  BLEServer* pServer = BLEDevice::createServer();
+  pServer->setCallbacks(this);
 
-  bleKeyboardInstance->hid = new BLEHIDDevice(pServer);
-  bleKeyboardInstance->inputKeyboard = bleKeyboardInstance->hid->inputReport(KEYBOARD_ID); // <-- input REPORTID from report map
-  bleKeyboardInstance->outputKeyboard = bleKeyboardInstance->hid->outputReport(KEYBOARD_ID);
-  bleKeyboardInstance->inputMediaKeys = bleKeyboardInstance->hid->inputReport(MEDIA_KEYS_ID);
-  bleKeyboardInstance->connectionStatus->inputKeyboard = bleKeyboardInstance->inputKeyboard;
-  bleKeyboardInstance->connectionStatus->outputKeyboard = bleKeyboardInstance->outputKeyboard;
-  //TridentTD
-  bleKeyboardInstance->connectionStatus->inputMediaKeys = bleKeyboardInstance->inputMediaKeys;
-  
-  bleKeyboardInstance->inputMouse = bleKeyboardInstance->hid->inputReport(MOUSE_ID); // <-- input REPORTID from report map
-  bleKeyboardInstance->connectionStatus->inputMouse = bleKeyboardInstance->inputMouse;
+  hid = new BLEHIDDevice(pServer);
+  inputKeyboard = hid->inputReport(KEYBOARD_ID);  // <-- input REPORTID from report map
+  outputKeyboard = hid->outputReport(KEYBOARD_ID);
+  inputMediaKeys = hid->inputReport(MEDIA_KEYS_ID);
+  connectionStatus->inputKeyboard = inputKeyboard;
+  connectionStatus->outputKeyboard = outputKeyboard;
+  connectionStatus->inputMediaKeys = inputMediaKeys;
+  inputMouse = hid->inputReport(MOUSE_ID);
+  connectionStatus->inputMouse = inputMouse;
  
-  bleKeyboardInstance->outputKeyboard->setCallbacks(new KeyboardOutputCallbacks());
+  outputKeyboard->setCallbacks(new KeyboardOutputCallbacks());
 
-  bleKeyboardInstance->hid->manufacturer()->setValue(bleKeyboardInstance->deviceManufacturer);
+  hid->manufacturer()->setValue(deviceManufacturer);
 
-  bleKeyboardInstance->hid->pnp(0x02, 0xe502, 0xa111, 0x0210);
-  bleKeyboardInstance->hid->hidInfo(0x00,0x01);
+  hid->pnp(0x02, vid, pid, version);
+  hid->hidInfo(0x00, 0x01);
 
-  BLESecurity *pSecurity = new BLESecurity();
 
-  pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND);
+#if defined(USE_NIMBLE)
 
-  bleKeyboardInstance->hid->reportMap((uint8_t*)_hidReportDescriptor, sizeof(_hidReportDescriptor));
-  bleKeyboardInstance->hid->startServices();
+  BLEDevice::setSecurityAuth(true, true, true);
 
-  BLEAdvertising *pAdvertising = pServer->getAdvertising();
-  pAdvertising->setAppearance(HID_KEYBOARD);
-  pAdvertising->addServiceUUID(bleKeyboardInstance->hid->hidService()->getUUID());
-  pAdvertising->start();
-  bleKeyboardInstance->hid->setBatteryLevel(bleKeyboardInstance->batteryLevel);
+#else
+
+  BLESecurity* pSecurity = new BLESecurity();
+  pSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+
+#endif // USE_NIMBLE
+
+  hid->reportMap((uint8_t*)_hidReportDescriptor, sizeof(_hidReportDescriptor));
+  hid->startServices();
+
+  onStarted(pServer);
+
+  advertising = pServer->getAdvertising();
+  advertising->setAppearance(HID_KEYBOARD);
+  advertising->addServiceUUID(hid->hidService()->getUUID());
+  advertising->setScanResponse(false);
+  advertising->start();
+  hid->setBatteryLevel(batteryLevel);
 
   ESP_LOGD(LOG_TAG, "Advertising started!");
-  vTaskDelay(portMAX_DELAY); //delay(portMAX_DELAY);
+}
+//must be called before begin in order to set the name
+void BleComboKeyboard::setName(std::string deviceName) {
+  this->deviceName = deviceName;
+}
+
+/**
+ * @brief Sets the waiting time (in milliseconds) between multiple keystrokes in NimBLE mode.
+ * 
+ * @param ms Time in milliseconds
+ */
+void BleComboKeyboard::setDelay(uint32_t ms) {
+  this->_delay_ms = ms;
+}
+
+void BleComboKeyboard::set_vendor_id(uint16_t vid) { 
+	this->vid = vid; 
+}
+
+void BleComboKeyboard::set_product_id(uint16_t pid) { 
+	this->pid = pid; 
+}
+
+void BleComboKeyboard::set_version(uint16_t version) { 
+	this->version = version; 
 }
 
 void BleComboKeyboard::sendReport(KeyReport* keys)
@@ -206,7 +239,11 @@ void BleComboKeyboard::sendReport(KeyReport* keys)
   {
     this->inputKeyboard->setValue((uint8_t*)keys, sizeof(KeyReport));
     this->inputKeyboard->notify();
-  }
+#if defined(USE_NIMBLE)        
+    // vTaskDelay(delayTicks);
+    this->delay_ms(_delay_ms);
+#endif // USE_NIMBLE
+  }	
 }
 
 void BleComboKeyboard::sendReport(MediaKeyReport* keys)
@@ -215,7 +252,11 @@ void BleComboKeyboard::sendReport(MediaKeyReport* keys)
   {
     this->inputMediaKeys->setValue((uint8_t*)keys, sizeof(MediaKeyReport));
     this->inputMediaKeys->notify();
-  }
+#if defined(USE_NIMBLE)        
+    //vTaskDelay(delayTicks);
+    this->delay_ms(_delay_ms);
+#endif // USE_NIMBLE
+  }	
 }
 
 extern
@@ -474,6 +515,7 @@ void BleComboKeyboard::releaseAll(void)
     _mediaKeyReport[0] = 0;
     _mediaKeyReport[1] = 0;
 	sendReport(&_keyReport);
+	sendReport(&_mediaKeyReport);
 }
 
 size_t BleComboKeyboard::write(uint8_t c)
@@ -505,3 +547,48 @@ size_t BleComboKeyboard::write(const uint8_t *buffer, size_t size) {
 	return n;
 }
 
+void BleComboKeyboard::onConnect(BLEServer* pServer) {
+  this->connected = true;
+
+#if !defined(USE_NIMBLE)
+
+  BLE2902* desc = (BLE2902*)this->inputKeyboard->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+  desc->setNotifications(true);
+  desc = (BLE2902*)this->inputMediaKeys->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+  desc->setNotifications(true);
+
+#endif // !USE_NIMBLE
+
+}
+
+void BleComboKeyboard::onDisconnect(BLEServer* pServer) {
+  this->connected = false;
+
+#if !defined(USE_NIMBLE)
+
+  BLE2902* desc = (BLE2902*)this->inputKeyboard->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+  desc->setNotifications(false);
+  desc = (BLE2902*)this->inputMediaKeys->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+  desc->setNotifications(false);
+
+  advertising->start();
+
+#endif // !USE_NIMBLE
+}
+
+void BleComboKeyboard::onWrite(BLECharacteristic* me) {
+  uint8_t* value = (uint8_t*)(me->getValue().c_str());
+  (void)value;
+  ESP_LOGI(LOG_TAG, "special keys: %d", *value);
+}
+
+void BleComboKeyboard::delay_ms(uint64_t ms) {
+  uint64_t m = esp_timer_get_time();
+  if(ms){
+    uint64_t e = (m + (ms * 1000));
+    if(m > e){ //overflow
+        while(esp_timer_get_time() > e) { }
+    }
+    while(esp_timer_get_time() < e) {}
+  }
+}
